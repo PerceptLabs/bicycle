@@ -33,14 +33,7 @@ interface ArtifactEntry {
 
 type TimelineEntry = ConversationEntry | ActionEntry | ArtifactEntry;
 
-const STREAM_FLUSH_MS = 60;
 const MAX_ACTION_STEPS = 14;
-
-function countWordTokens(input: string): number {
-    const trimmed = input.trim();
-    if (!trimmed) return 0;
-    return trimmed.split(/\s+/).length;
-}
 
 function appendStep(existing: string[], next: string): string[] {
     const trimmed = next.trim();
@@ -71,7 +64,7 @@ export function ChatPanel() {
     const bottomRef = useRef<HTMLDivElement>(null);
 
     const tokenBufferRef = useRef<Record<string, string>>({});
-    const tokenTimerRef = useRef<Record<string, number>>({});
+    const rafIdRef = useRef<number | null>(null);
 
     useEffect(() => {
         bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -96,7 +89,10 @@ export function ChatPanel() {
 
     useEffect(() => {
         return () => {
-            Object.values(tokenTimerRef.current).forEach(id => window.clearTimeout(id));
+            if (rafIdRef.current !== null) {
+                window.cancelAnimationFrame(rafIdRef.current);
+                rafIdRef.current = null;
+            }
         };
     }, []);
 
@@ -112,10 +108,6 @@ export function ChatPanel() {
     };
 
     const flushTokenBuffer = (artifactId: string) => {
-        if (tokenTimerRef.current[artifactId]) {
-            window.clearTimeout(tokenTimerRef.current[artifactId]);
-            tokenTimerRef.current[artifactId] = 0;
-        }
         const buffered = tokenBufferRef.current[artifactId];
         if (!buffered) return;
         tokenBufferRef.current[artifactId] = '';
@@ -129,11 +121,28 @@ export function ChatPanel() {
         }));
     };
 
+    const flushAllTokenBuffers = () => {
+        const artifactIds = Object.keys(tokenBufferRef.current);
+        for (const artifactId of artifactIds) {
+            flushTokenBuffer(artifactId);
+        }
+    };
+
+    const scheduleFlush = () => {
+        if (rafIdRef.current !== null) return;
+        rafIdRef.current = window.requestAnimationFrame(() => {
+            rafIdRef.current = null;
+            flushAllTokenBuffers();
+            if (Object.values(tokenBufferRef.current).some(Boolean)) {
+                scheduleFlush();
+            }
+        });
+    };
+
     const enqueueArtifactToken = (artifactId: string, delta: string) => {
         if (!delta) return;
         tokenBufferRef.current[artifactId] = `${tokenBufferRef.current[artifactId] || ''}${delta}`;
-        if (tokenTimerRef.current[artifactId]) return;
-        tokenTimerRef.current[artifactId] = window.setTimeout(() => flushTokenBuffer(artifactId), STREAM_FLUSH_MS);
+        scheduleFlush();
     };
 
     const applyLoopEvent = (
@@ -142,7 +151,7 @@ export function ChatPanel() {
     ) => {
         if (event.channel === 'artifact' && event.type === 'token') {
             enqueueArtifactToken(ids.artifactId, event.token || '');
-            const tokenDelta = typeof event.tokenCount === 'number' ? 0 : countWordTokens(event.token || '');
+            const tokenDelta = typeof event.tokenCount === 'number' ? 0 : Math.max(1, Math.round((event.token || '').length / 4));
             setTimeline(prev => updateEntry(prev, ids.artifactId, entry => {
                 if (entry.kind !== 'artifact') return entry;
                 return {
@@ -255,7 +264,7 @@ export function ChatPanel() {
         setIsTyping(true);
 
         const result = await runIterationLoop(currentInput, (event) => applyLoopEvent(ids, event));
-        flushTokenBuffer(ids.artifactId);
+        flushAllTokenBuffers();
 
         setTimeline(prev => updateEntry(prev, ids.narrativeId, entry => {
             if (entry.kind !== 'conversation') return entry;

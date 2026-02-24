@@ -1,4 +1,4 @@
-importScripts('https://unpkg.com/@isomorphic-git/lightning-fs@4.6.0/dist/lightning-fs.min.js');
+importScripts('/vendor/lightning-fs.min.js');
 
 const fs = new LightningFS('workspace');
 const pfs = fs.promises;

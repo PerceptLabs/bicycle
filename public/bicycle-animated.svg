@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 150" width="100%" height="100%">
+  <line x1="10" y1="127" x2="190" y2="127" stroke="#9ca3af" stroke-width="2" stroke-linecap="round" stroke-dasharray="8 24">
+    <animate attributeName="stroke-dashoffset" from="0" to="32" dur="0.305s" repeatCount="indefinite" />
+  </line>
+
+  <path d="
+    M 50 100 L 90 100 L 80 50 Z
+    M 80 50 L 130 45 L 90 100 Z
+    M 130 45 L 150 100
+  " fill="none" stroke="#0d9488" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+  
+  <path d="
+    M 70 50 L 90 50
+    M 130 45 L 125 35 L 140 35
+  " fill="none" stroke="#1f2937" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+
+  <g>
+    <circle cx="50" cy="100" r="25" fill="none" stroke="#1f2937" stroke-width="4" />
+    <g stroke="#1f2937" stroke-width="2" stroke-linecap="round">
+      <line x1="25" y1="100" x2="75" y2="100" />
+      <line x1="50" y1="75" x2="50" y2="125" />
+      <line x1="32.32" y1="82.32" x2="67.68" y2="117.68" />
+      <line x1="32.32" y1="117.68" x2="67.68" y2="82.32" />
+    </g>
+    <animateTransform attributeName="transform" type="rotate" from="0 50 100" to="360 50 100" dur="1.5s" repeatCount="indefinite" />
+  </g>
+
+  <g>
+    <circle cx="150" cy="100" r="25" fill="none" stroke="#1f2937" stroke-width="4" />
+    <g stroke="#1f2937" stroke-width="2" stroke-linecap="round">
+      <line x1="125" y1="100" x2="175" y2="100" />
+      <line x1="150" y1="75" x2="150" y2="125" />
+      <line x1="132.32" y1="82.32" x2="167.68" y2="117.68" />
+      <line x1="132.32" y1="117.68" x2="167.68" y2="82.32" />
+    </g>
+    <animateTransform attributeName="transform" type="rotate" from="0 150 100" to="360 150 100" dur="1.5s" repeatCount="indefinite" />
+  </g>
+
+  <g>
+    <circle cx="90" cy="100" r="5" fill="#1f2937" />
+    <line x1="90" y1="100" x2="90" y2="86" stroke="#1f2937" stroke-width="3" stroke-linecap="round" />
+    <circle cx="90" cy="86" r="3" fill="#1f2937" />
+    
+    <line x1="90" y1="100" x2="90" y2="114" stroke="#1f2937" stroke-width="3" stroke-linecap="round" />
+    <circle cx="90" cy="114" r="3" fill="#1f2937" />
+    <animateTransform attributeName="transform" type="rotate" from="0 90 100" to="360 90 100" dur="1.5s" repeatCount="indefinite" />
+  </g>
+</svg>

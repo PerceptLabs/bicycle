@@ -1,6 +1,3 @@
-import git from 'isomorphic-git';
-import { fs, pfs } from './fs';
-
 export const REPO_DIR = '/';
 export const AUTHOR = {
     name: 'App Builder',
@@ -13,7 +10,6 @@ const LOCK_LEASE_MS = 15000;
 const LOCK_HEARTBEAT_MS = 3000;
 const LOCK_WAIT_TIMEOUT_MS = 30000;
 const STALE_JOURNAL_MS = 45000;
-const HEAL_SNAPSHOT_MESSAGE = 'Auto-heal: Rebuilt git metadata from workspace snapshot';
 const OWNER_ID = `git-owner-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
 
 interface LockState {
@@ -32,6 +28,11 @@ interface JournalState {
     updatedAt: number;
 }
 
+interface CommitDurableOptions {
+    touchedPaths?: string[];
+    changedPaths?: string[];
+}
+
 export interface CommitDurableResult {
     ok: boolean;
     healed: boolean;
@@ -40,7 +41,31 @@ export interface CommitDurableResult {
     reason?: string;
 }
 
+type GitWorkerMethod = 'initRepo' | 'commitDurable' | 'getHistory' | 'recoverFromStaleJournal';
+
+interface GitWorkerRequest {
+    id: number;
+    method: GitWorkerMethod;
+    payload?: unknown;
+}
+
+interface GitWorkerResponse {
+    id: number;
+    ok: boolean;
+    result?: unknown;
+    error?: string;
+}
+
+interface PendingRequest {
+    resolve: (value: any) => void;
+    reject: (error: Error) => void;
+    timerId: number;
+}
+
 let coordinatorQueue: Promise<void> = Promise.resolve();
+let workerRef: Worker | null = null;
+let nextRequestId = 1;
+const pendingRequests = new Map<number, PendingRequest>();
 
 function nowMs() {
     return Date.now();
@@ -99,6 +124,95 @@ function clearJournal(storage: Storage, opId: string) {
     }
 }
 
+function stringifyError(error: unknown): string {
+    if (error instanceof Error) {
+        return `${error.name}: ${error.message}\n${error.stack || ''}`;
+    }
+    try {
+        return JSON.stringify(error);
+    } catch {
+        return String(error);
+    }
+}
+
+export function isRecoverableGitObjectError(error: unknown): boolean {
+    const text = stringifyError(error);
+    return /NotFoundError|Could not find [0-9a-f]{7,}|_readObject|resolveTree|statusMatrix/i.test(text);
+}
+
+function rejectAllPendingRequests(message: string) {
+    for (const [id, pending] of pendingRequests.entries()) {
+        window.clearTimeout(pending.timerId);
+        pending.reject(new Error(message));
+        pendingRequests.delete(id);
+    }
+}
+
+function resetWorkerInstance() {
+    if (workerRef) {
+        workerRef.terminate();
+        workerRef = null;
+    }
+    rejectAllPendingRequests('Git worker reset.');
+}
+
+function ensureWorker(): Worker {
+    if (workerRef) return workerRef;
+
+    const worker = new Worker(new URL('../workers/gitWorker.ts', import.meta.url), { type: 'module' });
+    worker.onmessage = (event: MessageEvent<GitWorkerResponse>) => {
+        const data = event.data;
+        if (!data || typeof data.id !== 'number') return;
+        const pending = pendingRequests.get(data.id);
+        if (!pending) return;
+        pendingRequests.delete(data.id);
+        window.clearTimeout(pending.timerId);
+        if (!data.ok) {
+            pending.reject(new Error(data.error || 'Git worker request failed.'));
+            return;
+        }
+        pending.resolve(data.result);
+    };
+    worker.onerror = (event) => {
+        resetWorkerInstance();
+        console.error('Git worker crashed', event.message || 'Unknown worker error.');
+    };
+    worker.onmessageerror = () => {
+        resetWorkerInstance();
+        console.error('Git worker message channel error.');
+    };
+
+    workerRef = worker;
+    return worker;
+}
+
+async function callWorker<T>(method: GitWorkerMethod, payload: unknown, timeoutMs = 60000): Promise<T> {
+    const worker = ensureWorker();
+    const id = nextRequestId++;
+
+    return new Promise<T>((resolve, reject) => {
+        const timerId = window.setTimeout(() => {
+            pendingRequests.delete(id);
+            resetWorkerInstance();
+            reject(new Error(`Git worker timeout for ${method}.`));
+        }, timeoutMs);
+
+        pendingRequests.set(id, { resolve, reject, timerId });
+        const request: GitWorkerRequest = { id, method, payload };
+        worker.postMessage(request);
+    });
+}
+
+function makeJournal(opId: string, stage: JournalState['stage'], message: string): JournalState {
+    return {
+        ownerId: OWNER_ID,
+        opId,
+        stage,
+        message,
+        updatedAt: nowMs()
+    };
+}
+
 async function withCoordinator<T>(task: () => Promise<T>): Promise<T> {
     const next = coordinatorQueue.then(() => task(), () => task());
     coordinatorQueue = next.then(() => undefined, () => undefined);
@@ -152,120 +266,6 @@ async function withLeaseLock<T>(opName: string, task: (opId: string) => Promise<
     throw new Error('Git lock acquisition timed out.');
 }
 
-function stringifyError(error: unknown): string {
-    if (error instanceof Error) {
-        return `${error.name}: ${error.message}\n${error.stack || ''}`;
-    }
-    try {
-        return JSON.stringify(error);
-    } catch {
-        return String(error);
-    }
-}
-
-export function isRecoverableGitObjectError(error: unknown): boolean {
-    const text = stringifyError(error);
-    return /NotFoundError|Could not find [0-9a-f]{7,}|_readObject|resolveTree|statusMatrix/i.test(text);
-}
-
-async function pathExists(path: string): Promise<boolean> {
-    try {
-        await pfs.stat(path);
-        return true;
-    } catch {
-        return false;
-    }
-}
-
-async function removePathRecursive(path: string): Promise<void> {
-    try {
-        const entries = await pfs.readdir(path);
-        if (Array.isArray(entries)) {
-            for (const entry of entries) {
-                await removePathRecursive(`${path}/${entry}`);
-            }
-            await pfs.rmdir(path);
-            return;
-        }
-    } catch {
-        // Fall through to unlink attempt.
-    }
-    try {
-        await pfs.unlink(path);
-    } catch {
-        // Ignore missing paths.
-    }
-}
-
-async function ensureRepoInitialized() {
-    try {
-        await git.init({ fs, dir: REPO_DIR });
-    } catch {
-        // ignore
-    }
-}
-
-async function statusMatrixSafe() {
-    return git.statusMatrix({ fs, dir: REPO_DIR });
-}
-
-async function stageAllChanges() {
-    const statusMatrix = await statusMatrixSafe();
-    let hasChanges = false;
-
-    for (const row of statusMatrix) {
-        const filepath = row[0];
-        const headStatus = row[1];
-        const worktreeStatus = row[2];
-        const stageStatus = row[3];
-
-        if (worktreeStatus !== headStatus || worktreeStatus !== stageStatus) {
-            hasChanges = true;
-            if (worktreeStatus === 0) {
-                await git.remove({ fs, dir: REPO_DIR, filepath });
-            } else {
-                await git.add({ fs, dir: REPO_DIR, filepath });
-            }
-        }
-    }
-
-    return hasChanges;
-}
-
-async function commitStaged(message: string): Promise<string | undefined> {
-    const hasChanges = await stageAllChanges();
-    if (!hasChanges) return undefined;
-
-    return git.commit({
-        fs,
-        dir: REPO_DIR,
-        author: AUTHOR,
-        message
-    });
-}
-
-async function verifyCommitReadable(sha?: string) {
-    if (sha) {
-        await git.readCommit({ fs, dir: REPO_DIR, oid: sha });
-    }
-    try {
-        const head = await git.resolveRef({ fs, dir: REPO_DIR, ref: 'HEAD' });
-        if (head) {
-            await git.readCommit({ fs, dir: REPO_DIR, oid: head });
-        }
-    } catch {
-        // Empty repo can have no HEAD.
-    }
-}
-
-async function rebuildRepoFromCurrentWorktree() {
-    if (await pathExists('/.git')) {
-        await removePathRecursive('/.git');
-    }
-    await git.init({ fs, dir: REPO_DIR });
-    await commitStaged(HEAL_SNAPSHOT_MESSAGE);
-}
-
 async function recoverStaleJournalIfNeeded() {
     const storage = getStorage();
     if (!storage) return;
@@ -274,54 +274,12 @@ async function recoverStaleJournalIfNeeded() {
     const stale = nowMs() - journal.updatedAt > STALE_JOURNAL_MS;
     if (!stale) return;
 
-    if (isRecoverableGitObjectError(new Error(`stale journal at ${journal.stage}`))) {
-        try {
-            await rebuildRepoFromCurrentWorktree();
-        } catch {
-            // Ignore and allow normal durable flow to handle failures.
-        }
+    try {
+        await callWorker('recoverFromStaleJournal', {}, 90000);
+    } catch {
+        // Ignore and proceed; current operation will report failures if any.
     }
     storage.removeItem(GIT_JOURNAL_KEY);
-}
-
-function makeJournal(opId: string, stage: JournalState['stage'], message: string): JournalState {
-    return {
-        ownerId: OWNER_ID,
-        opId,
-        stage,
-        message,
-        updatedAt: nowMs()
-    };
-}
-
-async function commitOnceWithJournal(message: string, opId: string) {
-    const storage = getStorage();
-    if (storage) writeJournal(storage, makeJournal(opId, 'start', message));
-
-    await ensureRepoInitialized();
-    try {
-        const head = await git.resolveRef({ fs, dir: REPO_DIR, ref: 'HEAD' });
-        if (head) {
-            await git.readCommit({ fs, dir: REPO_DIR, oid: head });
-        }
-    } catch {
-        // Empty or fresh repositories may not have a readable HEAD yet.
-    }
-    if (storage) writeJournal(storage, makeJournal(opId, 'preflight_done', message));
-
-    await statusMatrixSafe();
-    if (storage) writeJournal(storage, makeJournal(opId, 'status_matrix_done', message));
-
-    const sha = await commitStaged(message);
-    if (storage) {
-        writeJournal(storage, makeJournal(opId, 'staging_done', message));
-        writeJournal(storage, makeJournal(opId, 'commit_done', message));
-    }
-
-    await verifyCommitReadable(sha);
-    if (storage) writeJournal(storage, makeJournal(opId, 'verify_done', message));
-
-    return sha;
 }
 
 /**
@@ -331,56 +289,42 @@ export async function initRepo() {
     await withCoordinator(async () => {
         await withLeaseLock('init', async () => {
             await recoverStaleJournalIfNeeded();
-            await ensureRepoInitialized();
+            await callWorker('initRepo', {}, 45000);
         });
     });
 }
 
-export async function commitAllDurable(message: string): Promise<CommitDurableResult> {
+export async function commitAllDurable(message: string, options: CommitDurableOptions = {}): Promise<CommitDurableResult> {
     return withCoordinator(async () => (
         withLeaseLock('commit', async (opId) => {
             await recoverStaleJournalIfNeeded();
             const storage = getStorage();
+            if (storage) writeJournal(storage, makeJournal(opId, 'start', message));
+            if (storage) writeJournal(storage, makeJournal(opId, 'preflight_done', message));
 
             try {
-                const sha = await commitOnceWithJournal(message, opId);
+                const result = await callWorker<CommitDurableResult>('commitDurable', {
+                    message,
+                    touchedPaths: options.touchedPaths || [],
+                    changedPaths: options.changedPaths || []
+                }, 120000);
+
+                if (storage) {
+                    writeJournal(storage, makeJournal(opId, 'status_matrix_done', message));
+                    writeJournal(storage, makeJournal(opId, 'staging_done', message));
+                    writeJournal(storage, makeJournal(opId, 'commit_done', message));
+                    writeJournal(storage, makeJournal(opId, 'verify_done', message));
+                    clearJournal(storage, opId);
+                }
+                return result;
+            } catch (error) {
                 if (storage) clearJournal(storage, opId);
                 return {
-                    ok: true,
+                    ok: false,
                     healed: false,
                     historyReset: false,
-                    sha
+                    reason: stringifyError(error)
                 };
-            } catch (error) {
-                if (!isRecoverableGitObjectError(error)) {
-                    if (storage) clearJournal(storage, opId);
-                    return {
-                        ok: false,
-                        healed: false,
-                        historyReset: false,
-                        reason: stringifyError(error)
-                    };
-                }
-
-                try {
-                    await rebuildRepoFromCurrentWorktree();
-                    const retrySha = await commitOnceWithJournal(message, opId);
-                    if (storage) clearJournal(storage, opId);
-                    return {
-                        ok: true,
-                        healed: true,
-                        historyReset: true,
-                        sha: retrySha
-                    };
-                } catch (retryError) {
-                    if (storage) clearJournal(storage, opId);
-                    return {
-                        ok: false,
-                        healed: true,
-                        historyReset: true,
-                        reason: stringifyError(retryError)
-                    };
-                }
             }
         })
     ));
@@ -401,7 +345,7 @@ export async function commitAll(message: string) {
 export async function getHistory() {
     try {
         return await withCoordinator(async () => (
-            withLeaseLock('history', async () => git.log({ fs, dir: REPO_DIR }))
+            withLeaseLock('history', async () => callWorker<any[]>('getHistory', {}, 60000))
         ));
     } catch {
         return [];

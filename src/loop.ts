@@ -6,9 +6,10 @@ import {
   writeProjectFile
 } from './core/fs';
 import { commitAllDurable, initRepo } from './core/git';
-import { getCurrentProjectId } from './core/projects';
+import { getCurrentProjectId, getProjectRoot } from './core/projects';
 import {
   generateAppFromEndpoint,
+  generatePatchFromEndpoint,
   type GenerationResult
 } from './utils/ai';
 import { addDiagnostic, getDiagnosticsSummaryForPrompt, getLatestSyntaxFailureContext } from './core/diagnostics';
@@ -28,9 +29,28 @@ import {
 import { buildDesignGuidanceBlock, inferDesignArchetype } from './prompts/designGuide';
 import { selectPromptShots } from './prompts/shotSelector';
 import { BUILDER_AGENT_NAME } from './config/brand';
+import { applyPatchOps, validatePatchOps } from './utils/patchOps';
 
 const MAX_INTERNAL_ITERATIONS = 1;
 const NARRATIVE_BLOCKLIST = ['awesome', 'elite', 'killer', "let's crush", 'legendary', 'insane'];
+
+const PATCH_SYSTEM_PROMPT = `You generate deterministic code patch operations for NanoCycle.
+Return valid JSON only with this shape:
+{
+  "ops": [
+    { "type": "replace_range", "path": "/file.js", "start": 0, "end": 2, "lines": ["..."] },
+    { "type": "insert_at", "path": "/file.js", "index": 4, "lines": ["..."] },
+    { "type": "delete_range", "path": "/file.js", "start": 6, "end": 8 },
+    { "type": "replace_file", "path": "/file.js", "content": "..." }
+  ]
+}
+
+Rules:
+- Line ranges are 0-indexed and end-exclusive.
+- Apply edits as small targeted changes.
+- Do not include markdown.
+- Do not include explanations.
+- Do not create operations for files that do not exist.`;
 
 /**
  * Triggers a reload of all connected preview iframes.
@@ -190,6 +210,12 @@ function countWordTokens(input: string): number {
   const trimmed = input.trim();
   if (!trimmed) return 0;
   return trimmed.split(/\s+/).length;
+}
+
+function isSmallModificationRequest(prompt: string): boolean {
+  const text = prompt.toLowerCase();
+  return /\b(update|tweak|adjust|change|fix|refine|polish|rename|spacing|copy|color|contrast|hover|button|alignment|layout)\b/.test(text)
+    && !/\b(rebuild|rewrite|from scratch|new app|new website|create full|start over)\b/.test(text);
 }
 
 async function loadProjectFilesMap(projectId: string): Promise<Map<string, string>> {
@@ -424,19 +450,17 @@ export async function runIterationLoop(prompt: string, update: (event: LoopUpdat
         message
       }),
       onToken: (token: string) => {
-        streamedTokenCount += countWordTokens(token);
         emit(update, {
           type: 'token',
           channel: 'artifact',
           token,
-          tokenCount: streamedTokenCount,
           iteration,
           totalIterations: MAX_INTERNAL_ITERATIONS
         });
       },
       onComplete: (finalText: string) => {
+        streamedTokenCount = finalText ? countWordTokens(finalText) : 0;
         if (streamedTokenCount === 0 && finalText) {
-          streamedTokenCount += countWordTokens(finalText);
           emit(update, {
             type: 'token',
             channel: 'artifact',
@@ -446,6 +470,15 @@ export async function runIterationLoop(prompt: string, update: (event: LoopUpdat
             totalIterations: MAX_INTERNAL_ITERATIONS
           });
         }
+        emit(update, {
+          type: 'step',
+          channel: 'artifact',
+          step: 'stream',
+          iteration,
+          totalIterations: MAX_INTERNAL_ITERATIONS,
+          message: 'Generation stream completed.',
+          tokenCount: streamedTokenCount
+        });
         emit(update, {
           type: 'step',
           channel: 'action',
@@ -489,27 +522,125 @@ Keep app.js as the entrypoint and import local modules with explicit relative pa
 Use selected examples as patterns; do not copy snippets literally.
 Ensure all referenced local files are included in files[].`;
 
+    const runFullGeneration = () => generateAppFromEndpoint(contextualPrompt, SYSTEM_PROMPT, modelCallbacks);
     let generated: GenerationResult;
-    try {
-      generated = await generateAppFromEndpoint(contextualPrompt, SYSTEM_PROMPT, modelCallbacks);
-    } catch (genError: any) {
-      addDiagnostic({
-        projectId,
-        source: 'builder',
-        level: 'error',
-        errorKind: 'other',
-        message: 'Inference failed',
-        details: genError?.message || 'Unknown inference failure.'
-      });
+    const shouldTryPatchMode = isSmallModificationRequest(prompt);
+    if (shouldTryPatchMode) {
       emit(update, {
-        type: 'final',
-        channel: 'narrative',
-        message: buildNarrativeMessage('inference_failed', { iteration })
+        type: 'step',
+        channel: 'action',
+        step: 'patch',
+        iteration,
+        totalIterations: MAX_INTERNAL_ITERATIONS,
+        message: 'Attempting patch mode for incremental edits...'
       });
-      return {
-        ok: false,
-        error: genError?.message || 'Model output could not be parsed.'
-      };
+      try {
+        const patchPrompt = `Apply the user's requested change using deterministic patch ops.
+
+User request:
+${prompt}
+
+Current project files:
+${renderProjectContextFromMap(workingSet, 12000)}
+
+Return patch ops only.`;
+        const patchResponse = await generatePatchFromEndpoint(patchPrompt, PATCH_SYSTEM_PROMPT, modelCallbacks);
+        const validated = validatePatchOps(patchResponse.ops);
+        if (!validated.ok) {
+          throw new Error(validated.error || 'Patch validation failed.');
+        }
+        const patched = applyPatchOps(workingSet, validated.ops);
+        if (!patched.ok) {
+          throw new Error(patched.error || 'Patch apply failed.');
+        }
+
+        const patchedHtml = patched.files.get('/index.html');
+        const patchedJs = patched.files.get('/app.js');
+        if (!patchedHtml || !patchedJs) {
+          throw new Error('Patched output is missing /index.html or /app.js.');
+        }
+
+        const patchedExtraFiles = patched.changedPaths
+          .filter(path => path !== '/index.html' && path !== '/app.js')
+          .map((path) => ({
+            path,
+            content: patched.files.get(path) || ''
+          }));
+        generated = {
+          html: patchedHtml,
+          js: patchedJs,
+          files: patchedExtraFiles
+        };
+
+        emit(update, {
+          type: 'step',
+          channel: 'action',
+          step: 'patch',
+          iteration,
+          totalIterations: MAX_INTERNAL_ITERATIONS,
+          message: `Patch mode applied ${patched.changedPaths.length} file change(s).`
+        });
+      } catch (patchError: any) {
+        addDiagnostic({
+          projectId,
+          source: 'builder',
+          level: 'warn',
+          errorKind: 'other',
+          message: 'Patch mode fallback',
+          details: patchError?.message || 'Patch mode failed; using full regeneration.'
+        });
+        emit(update, {
+          type: 'step',
+          channel: 'action',
+          step: 'patch',
+          iteration,
+          totalIterations: MAX_INTERNAL_ITERATIONS,
+          message: 'Patch mode failed. Falling back to full generation.'
+        });
+        try {
+          generated = await runFullGeneration();
+        } catch (genError: any) {
+          addDiagnostic({
+            projectId,
+            source: 'builder',
+            level: 'error',
+            errorKind: 'other',
+            message: 'Inference failed',
+            details: genError?.message || 'Unknown inference failure.'
+          });
+          emit(update, {
+            type: 'final',
+            channel: 'narrative',
+            message: buildNarrativeMessage('inference_failed', { iteration })
+          });
+          return {
+            ok: false,
+            error: genError?.message || 'Model output could not be parsed.'
+          };
+        }
+      }
+    } else {
+      try {
+        generated = await runFullGeneration();
+      } catch (genError: any) {
+        addDiagnostic({
+          projectId,
+          source: 'builder',
+          level: 'error',
+          errorKind: 'other',
+          message: 'Inference failed',
+          details: genError?.message || 'Unknown inference failure.'
+        });
+        emit(update, {
+          type: 'final',
+          channel: 'narrative',
+          message: buildNarrativeMessage('inference_failed', { iteration })
+        });
+        return {
+          ok: false,
+          error: genError?.message || 'Model output could not be parsed.'
+        };
+      }
     }
 
     const candidateHtml = generated.html;
@@ -625,6 +756,11 @@ Ensure all referenced local files are included in files[].`;
     const instrumentedHtml = injectPreviewBridge(finalHtml);
     const currentFiles = await loadProjectFilesMap(projectId);
     const pendingWrites: Array<{ path: string; content: string }> = [];
+    const touchedPaths = [
+      '/index.html',
+      '/app.js',
+      ...finalExtraFiles.map(file => file.path)
+    ];
 
     if (currentFiles.get('/index.html') !== instrumentedHtml) {
       pendingWrites.push({ path: '/index.html', content: instrumentedHtml });
@@ -660,40 +796,55 @@ Ensure all referenced local files are included in files[].`;
     }
 
     emit(update, { type: 'step', channel: 'action', step: 'commit', message: 'Finalizing changes...' });
+    const projectRoot = getProjectRoot(projectId).replace(/^\/+/, '');
+    const changedPaths = pendingWrites.map(file => `${projectRoot}${file.path}`);
+    const touchedGitPaths = touchedPaths.map(path => `${projectRoot}${path}`);
 
-    const commitResult = await commitAllDurable(`Update: ${prompt}`);
-    if (!commitResult.ok) {
-      addDiagnostic({
-        projectId,
-        source: 'builder',
-        level: 'warn',
-        errorKind: 'other',
-        message: 'Commit failed',
-        details: commitResult.reason || 'Unknown commit error.'
-      });
+    if (changedPaths.length === 0) {
       emit(update, {
         type: 'step',
         channel: 'action',
         step: 'commit',
-        message: 'Commit failed. Preview update continues.'
+        message: 'No file changes detected. Skipping commit.'
       });
     } else {
-      if (commitResult.healed) {
+      const commitResult = await commitAllDurable(`Update: ${prompt}`, {
+        touchedPaths: touchedGitPaths,
+        changedPaths
+      });
+      if (!commitResult.ok) {
         addDiagnostic({
           projectId,
           source: 'builder',
           level: 'warn',
           errorKind: 'other',
-          message: 'Git auto-heal applied',
-          details: 'Recovered from git object inconsistency and rebuilt metadata snapshot.'
+          message: 'Commit failed',
+          details: commitResult.reason || 'Unknown commit error.'
+        });
+        emit(update, {
+          type: 'step',
+          channel: 'action',
+          step: 'commit',
+          message: 'Commit failed. Preview update continues.'
+        });
+      } else {
+        if (commitResult.healed) {
+          addDiagnostic({
+            projectId,
+            source: 'builder',
+            level: 'warn',
+            errorKind: 'other',
+            message: 'Git auto-heal applied',
+            details: 'Recovered from git object inconsistency and rebuilt metadata snapshot.'
+          });
+        }
+        emit(update, {
+          type: 'step',
+          channel: 'action',
+          step: 'commit',
+          message: 'Commit completed.'
         });
       }
-      emit(update, {
-        type: 'step',
-        channel: 'action',
-        step: 'commit',
-        message: 'Commit completed.'
-      });
     }
 
     emit(update, {
@@ -750,7 +901,11 @@ async function bootstrapWorkspace() {
     // Ignore if already initialized
   }
   try {
-    await commitAllDurable('Initial commit: Workspace setup');
+    const projectId = getCurrentProjectId();
+    const projectRoot = getProjectRoot(projectId).replace(/^\/+/, '');
+    const files = await listProjectFilesDeep(projectId);
+    const changedPaths = files.map(file => `${projectRoot}/${file}`);
+    await commitAllDurable('Initial commit: Workspace setup', { changedPaths });
   } catch (e) {
     // Ignore if already initialized
   }

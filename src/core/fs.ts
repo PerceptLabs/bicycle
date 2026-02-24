@@ -1,5 +1,4 @@
 import FS from '@isomorphic-git/lightning-fs';
-import JSZip from 'jszip';
 import { ensureProjectRegistry, getCurrentProjectId, getProjectRoot, PROJECTS_ROOT, touchProject } from './projects';
 import { injectPreviewBridge } from './previewBridge';
 import { APP_BRAND } from '../config/brand';
@@ -323,6 +322,7 @@ async function walkFiles(dir: string, relativePrefix = ''): Promise<Array<{ full
 
 export async function exportProjectAsZip(projectId: string = getCurrentProjectId()) {
     await initProjectWorkspace(projectId);
+    const { default: JSZip } = await import('jszip');
 
     const zip = new JSZip();
     const root = getProjectRoot(projectId);

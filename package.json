@@ -4,6 +4,8 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "predev": "node scripts/sync-sw-vendor.mjs",
+    "prebuild": "node scripts/sync-sw-vendor.mjs",
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",

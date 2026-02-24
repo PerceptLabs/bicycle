@@ -1,15 +1,32 @@
 import { useEffect, useState } from 'preact/hooks';
 import { Workspace } from './components/Workspace';
 import { initializeEditorLoop } from './loop';
-import { SettingsModal } from './components/SettingsModal';
 import { APP_BRAND } from './config/brand';
+import type { ComponentType } from 'preact';
+
+type SettingsModalProps = {
+  onClose: () => void;
+};
 
 export function App() {
   const [showSettings, setShowSettings] = useState(false);
+  const [SettingsModalComponent, setSettingsModalComponent] = useState<ComponentType<SettingsModalProps> | null>(null);
 
   useEffect(() => {
     initializeEditorLoop();
   }, []);
+
+  useEffect(() => {
+    if (!showSettings || SettingsModalComponent) return;
+    let cancelled = false;
+    import('./components/SettingsModal').then((mod) => {
+      if (cancelled) return;
+      setSettingsModalComponent(() => mod.SettingsModal);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [showSettings, SettingsModalComponent]);
 
   return (
     <div data-theme="dark" className="h-[100dvh] w-screen overflow-hidden bg-base-300 text-base-content flex flex-col font-sans">
@@ -33,7 +50,7 @@ export function App() {
         <Workspace />
       </main>
 
-      {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
+      {showSettings && SettingsModalComponent && <SettingsModalComponent onClose={() => setShowSettings(false)} />}
     </div>
   )
 }

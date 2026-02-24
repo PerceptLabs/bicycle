@@ -1,5 +1,6 @@
-import { getSettings } from '../components/SettingsModal';
+import { getSettings } from '../core/settings';
 import { INFERENCE_CLIENT_TITLE } from '../config/brand';
+import type { PatchOp } from './patchOps';
 
 export interface GenerationResult {
     html: string;
@@ -10,6 +11,10 @@ export interface GenerationResult {
 export interface GeneratedFile {
     path: string;
     content: string;
+}
+
+export interface PatchGenerationResult {
+    ops: PatchOp[];
 }
 
 export interface GenerationCallbacks {
@@ -165,7 +170,33 @@ function parseGenerationResult(rawContent: string): GenerationResult {
     throw new Error('Provider returned invalid JSON content. Ask the model to output strict JSON with "html" and "js" keys, or switch to a stronger model.');
 }
 
+function parsePatchResult(rawContent: string): PatchGenerationResult {
+    const trimmed = rawContent.trim();
+    const fencedMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    const unfenced = fencedMatch ? fencedMatch[1].trim() : trimmed;
+    const extracted = extractFirstJSONObject(unfenced);
+    const candidates = [unfenced];
+    if (extracted && extracted !== unfenced) candidates.push(extracted);
+
+    let parsed: any = null;
+    for (const candidate of candidates) {
+        try {
+            parsed = JSON.parse(candidate);
+            break;
+        } catch {
+            // Try next candidate.
+        }
+    }
+
+    if (parsed && typeof parsed === 'object' && Array.isArray(parsed.ops)) {
+        return { ops: parsed.ops as PatchOp[] };
+    }
+
+    throw new Error('Provider returned invalid patch JSON content. Expected { "ops": [...] }.');
+}
+
 type ResponseFormatMode = 'json_schema' | 'json_object' | 'none';
+type GenerationMode = 'full' | 'patch';
 
 const FULL_OUTPUT_SCHEMA = {
     name: 'nanobuild_generation',
@@ -194,6 +225,40 @@ const FULL_OUTPUT_SCHEMA = {
     }
 };
 
+const PATCH_OUTPUT_SCHEMA = {
+    name: 'nanobuild_patch_generation',
+    strict: true,
+    schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+            ops: {
+                type: 'array',
+                minItems: 1,
+                maxItems: 16,
+                items: {
+                    type: 'object',
+                    properties: {
+                        type: { type: 'string', enum: ['replace_range', 'insert_at', 'delete_range', 'replace_file'] },
+                        path: { type: 'string' },
+                        start: { type: 'integer' },
+                        end: { type: 'integer' },
+                        index: { type: 'integer' },
+                        lines: {
+                            type: 'array',
+                            items: { type: 'string' }
+                        },
+                        content: { type: 'string' }
+                    },
+                    required: ['type', 'path'],
+                    additionalProperties: false
+                }
+            }
+        },
+        required: ['ops']
+    }
+};
+
 function shouldFallbackResponseFormat(status: number, errorText: string): boolean {
     if (status < 400 || status >= 500) return false;
     return /response_format|json_schema|unsupported|not support|invalid.*schema|unknown field|unrecognized/i.test(errorText);
@@ -211,7 +276,8 @@ function buildCompletionBody(
     temperature: number,
     mode: ResponseFormatMode,
     isOpenRouter: boolean,
-    stream: boolean
+    stream: boolean,
+    generationMode: GenerationMode
 ): Record<string, any> {
     const body: Record<string, any> = {
         model,
@@ -226,7 +292,7 @@ function buildCompletionBody(
     if (mode === 'json_schema') {
         body.response_format = {
             type: 'json_schema',
-            json_schema: FULL_OUTPUT_SCHEMA
+            json_schema: generationMode === 'patch' ? PATCH_OUTPUT_SCHEMA : FULL_OUTPUT_SCHEMA
         };
     } else if (mode === 'json_object') {
         body.response_format = { type: 'json_object' };
@@ -394,11 +460,12 @@ export async function fetchAvailableModels(baseUrl: string, apiKey: string): Pro
     }
 }
 
-export async function generateAppFromEndpoint(
+async function generateFromEndpoint<T>(
     prompt: string,
     systemPrompt: string,
-    callbacksInput: GenerationCallbacks | ((msg: string) => void)
-): Promise<GenerationResult> {
+    callbacksInput: GenerationCallbacks | ((msg: string) => void),
+    generationMode: GenerationMode
+): Promise<T> {
     const callbacks = normalizeCallbacks(callbacksInput);
     const onPhase = callbacks.onPhase || (() => {});
     const settings = getSettings();
@@ -484,7 +551,8 @@ export async function generateAppFromEndpoint(
             settings.temperature !== undefined ? Number(settings.temperature) : 0.2,
             mode,
             isOpenRouter,
-            stream
+            stream,
+            generationMode
         );
 
         const response = await durableFetch(endpoint, {
@@ -553,7 +621,9 @@ export async function generateAppFromEndpoint(
                 }
 
                 try {
-                    return parseGenerationResult(content);
+                    return (generationMode === 'patch'
+                        ? parsePatchResult(content)
+                        : parseGenerationResult(content)) as T;
                 } catch (parseErr: any) {
                     if (i < formatModes.length - 1) {
                         onPhase(`Could not parse ${modeLabel} output. Retrying with fallback format...`);
@@ -563,7 +633,9 @@ export async function generateAppFromEndpoint(
                 }
             }
 
-            throw new Error('Provider did not return a valid structured app payload.');
+            throw new Error(generationMode === 'patch'
+                ? 'Provider did not return valid structured patch ops.'
+                : 'Provider did not return a valid structured app payload.');
         } finally {
             window.clearInterval(heartbeat);
         }
@@ -576,4 +648,20 @@ export async function generateAppFromEndpoint(
         onPhase('Error connecting to Inference Provider: ' + message);
         throw new Error(message);
     }
+}
+
+export async function generateAppFromEndpoint(
+    prompt: string,
+    systemPrompt: string,
+    callbacksInput: GenerationCallbacks | ((msg: string) => void)
+): Promise<GenerationResult> {
+    return generateFromEndpoint<GenerationResult>(prompt, systemPrompt, callbacksInput, 'full');
+}
+
+export async function generatePatchFromEndpoint(
+    prompt: string,
+    systemPrompt: string,
+    callbacksInput: GenerationCallbacks | ((msg: string) => void)
+): Promise<PatchGenerationResult> {
+    return generateFromEndpoint<PatchGenerationResult>(prompt, systemPrompt, callbacksInput, 'patch');
 }
